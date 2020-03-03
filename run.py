@@ -8,8 +8,16 @@ import os
 import re
 import pandas as pd
 import numpy as np
-from math import factorial
 from itertools import combinations, product
+import tensorflow as tf
+
+flags = tf.flags
+FLAGS = flags.FLAGS
+
+flags.DEFINE_string("data_dir", 'data', "Data directory where raw data located.")
+flags.DEFINE_integer("batch_size", 64, "batch_size")
+flags.DEFINE_integer("seq_length", 64, "seq_length")
+flags.DEFINE_integer("epochs", 10, "epochs")
 
 
 class InputFeatures(object):
@@ -132,15 +140,14 @@ class DataProcess(object):
                                                tf.TensorShape([])))
 
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 os.environ['TF_KERAS'] = '1'  # 必须使用tf.keras
 
 import tensorflow as tf
 
 set_gelu('tanh')  # 切换gelu版本
 
-maxlen = 64
-batch_size = 32
+maxlen = FLAGS.seq_length
+batch_size = FLAGS.batch_size
 config_path = 'model/roberta/bert_config.json'
 checkpoint_path = 'model/roberta/bert_model.ckpt'
 dict_path = 'model/roberta/vocab.txt'
@@ -159,9 +166,10 @@ class data_generator(DataGenerator):
     """数据生成器
     """
 
-    def __init__(self, data, batch_size=32):
+    def __init__(self, data, batch_size=32, isTrian=False):
         super().__init__(data, batch_size)
         self.re_punctuation = '[{}]+'.format(''';'\",.!?；‘’“”，。！？''')
+        self.isTrian = isTrian
 
     def __iter__(self, random=False):
         idxs = list(range(len(self.data)))
@@ -178,11 +186,11 @@ class data_generator(DataGenerator):
             batch_token_ids.append(token_ids)
             batch_segment_ids.append(segment_ids)
             batch_labels.append([e.label])
-
-            token_ids, segment_ids = tokenizer.encode(e.query2, e.query1, max_length=maxlen)
-            batch_token_ids.append(token_ids)
-            batch_segment_ids.append(segment_ids)
-            batch_labels.append([e.label])
+            if self.isTrian:
+                token_ids, segment_ids = tokenizer.encode(e.query2, e.query1, max_length=maxlen)
+                batch_token_ids.append(token_ids)
+                batch_segment_ids.append(segment_ids)
+                batch_labels.append([e.label])
 
             if len(batch_token_ids) == self.batch_size or i == idxs[-1]:
                 batch_token_ids = sequence_padding(batch_token_ids)
@@ -192,30 +200,27 @@ class data_generator(DataGenerator):
                 batch_token_ids, batch_segment_ids, batch_labels = [], [], []
 
 
-strategy = tf.distribute.MirroredStrategy(devices=["/gpu:0", "/gpu:1"])
-with strategy.scope():
-    # 加载预训练模型
-    bert = build_bert_model(
-        config_path=config_path,
-        checkpoint_path=checkpoint_path,
-        with_pool=True,
-        return_keras_model=False,
-    )
+# 加载预训练模型
+bert = build_bert_model(
+    config_path=config_path,
+    checkpoint_path=checkpoint_path,
+    with_pool=True,
+    return_keras_model=False,
+)
 
-    output = Dropout(rate=0.1)(bert.model.output)
-    output = Dense(units=2,
-                   activation='softmax',
-                   kernel_initializer=bert.initializer)(output)
-    bert.model.trainable = False
-    model = keras.models.Model(bert.model.input, output)
-    model.summary()
+output = Dropout(rate=0.1)(bert.model.output)
+output = Dense(units=2,
+               activation='softmax',
+               kernel_initializer=bert.initializer)(output)
+bert.model.trainable = False
+model = keras.models.Model(bert.model.input, output)
+model.summary()
 
-    model.compile(
-        loss='sparse_categorical_crossentropy',
-        optimizer=Adam(5e-5),  # 用足够小的学习率
-        # optimizer=PiecewiseLinearLearningRate(Adam(5e-5), {10000: 1, 30000: 0.1}),
-        metrics=['accuracy'],
-    )
+model.compile(
+    loss='sparse_categorical_crossentropy',
+    optimizer=Adam(5e-5),  # 用足够小的学习率
+    metrics=['accuracy'],
+)
 
 
 def evaluate(data):
@@ -233,52 +238,66 @@ class Evaluator(keras.callbacks.Callback):
         self.best_val_acc = 0.
 
     def on_epoch_end(self, epoch, logs=None):
-        val_acc = evaluate(valid_generator)
-        if val_acc > self.best_val_acc:
-            self.best_val_acc = val_acc
-            model.save_weights('best_model.weights')
-        test_acc = evaluate(test_generator)
-        print(u'val_acc: %.5f, best_val_acc: %.5f, test_acc: %.5f\n'
-              % (val_acc, self.best_val_acc, test_acc))
+        test_acc = evaluate(valid_generator)
+        print(u'test_acc: %.5f\n'
+              % test_acc)
+        if self.best_val_acc < test_acc:
+            result = []
+            for x_true, y_true in tests_generator:
+                y_pred = model.predict(x_true).argmax(axis=1)
+                result = result + y_pred.tolist()
+            result = [[i, e] for i, e in enumerate(result)]
+            result = np.array(result)
+            print('save result')
+            result = pd.DataFrame(result, columns=['id', 'label'])
+            result.to_csv('result.csv', index=False)
+            self.best_val_acc = test_acc
+
+
+def getTestData(data, batch_size):
+    idxs = list(range(len(data)))
+    batch_token_ids, batch_segment_ids, batch_labels = [], [], []
+    for i in idxs:
+        e = data[i]
+        token_ids, segment_ids = tokenizer.encode(e.query1, e.query2, max_length=maxlen)
+        batch_token_ids.append(token_ids)
+        batch_segment_ids.append(segment_ids)
+        batch_labels.append([e.label])
+
+        if len(batch_token_ids) == batch_size or i == idxs[-1]:
+            batch_token_ids = sequence_padding(batch_token_ids)
+            batch_segment_ids = sequence_padding(batch_segment_ids)
+            batch_labels = sequence_padding(batch_labels)
+            yield [batch_token_ids, batch_segment_ids], batch_labels
+            batch_token_ids, batch_segment_ids, batch_labels = [], [], []
 
 
 if __name__ == '__main__':
-    dataProcess = DataProcess('data')
-    test_data = dataProcess._get_examples('data/dev.csv')
+    print(tf.__version__)
+    dataProcess = DataProcess(FLAGS.data_dir)
+    valid_data = dataProcess._get_examples(os.path.join(FLAGS.data_dir, 'dev.csv'))
+    train_data = dataProcess._get_examples(os.path.join(FLAGS.data_dir, 'train.csv'))
+    tests_data = dataProcess._get_examples(os.path.join(FLAGS.data_dir, 'test.csv'))
 
-    examples = dataProcess._get_examples('data/train.csv')
     questions = {}
-    for e in examples:
+    for e in train_data:
         question = questions.get(e.getKey(), Question(e.category, e.query1))
         question.add(e)
         questions[e.getKey()] = question
 
-    print(len(questions))
-
-    examples = []
+    train_data = []
     for value in questions.values():
-        examples = examples + value.toExamples()
-    print(len(examples))
+        train_data = train_data + value.toExamples()
 
-    # 加载数据集
-    # all_data = load_data('data/train.csv')
-    # all_data = all_data + load_data('data/dev.csv')
-
-    random_order = range(len(examples))
-    np.random.shuffle(list(random_order))
-    train_data = [examples[j] for i, j in enumerate(random_order) if i % 6 != 1]
-    valid_data = [examples[j] for i, j in enumerate(random_order) if i % 6 == 1]
-    # test_data = [examples[j] for i, j in enumerate(random_order) if i % 6 == 2]
     # 转换数据集
-    train_generator = data_generator(train_data, batch_size)
+    train_generator = data_generator(train_data, batch_size, isTrian=True)
     valid_generator = data_generator(valid_data, batch_size)
-    test_generator = data_generator(test_data, batch_size)
+    tests_generator = getTestData(tests_data, batch_size)
 
     evaluator = Evaluator()
     model.fit_generator(train_generator.forfit(),
                         steps_per_epoch=len(train_generator),
-                        epochs=20,
+                        epochs=FLAGS.epochs,
                         callbacks=[evaluator], verbose=2)
 
-    model.load_weights('best_model.weights')
-    print(u'final test acc: %05f\n' % (evaluate(test_generator)))
+    print(u'final test acc: %05f\n' % (evaluate(valid_generator)))
