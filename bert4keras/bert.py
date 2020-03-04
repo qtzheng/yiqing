@@ -143,7 +143,17 @@ class BertModel(object):
         if self.with_pool or self.with_nsp:
             # Pooler部分（提取CLS向量）
             x = outputs[0]
-            x = Lambda(lambda x: x[:, 0], name='Pooler')(x)
+
+            # x1 = Bidirectional(LSTM(512, return_sequences=True, dropout=0.2, kernel_initializer=self.initializer))(
+            #     x)
+            # x1 = Bidirectional(LSTM(512, return_sequences=True, dropout=0.2, kernel_initializer=self.initializer))(x1)
+            # x1 = Bidirectional(LSTM(512, return_sequences=True, dropout=0.2, kernel_initializer=self.initializer))(x1)
+            x1 = Bidirectional(LSTM(1024, dropout=0.2, kernel_initializer=self.initializer))(x)
+            x1 = Dense(units=self.hidden_size,
+                       activation='tanh',
+                       kernel_initializer=self.initializer)(x1)
+
+            x = Lambda(lambda x: tf.reduce_mean(x, axis=1), name='Pooler')(x)
             pool_activation = 'tanh' if self.with_pool is True else self.with_pool
             x = Dense(units=self.hidden_size,
                       activation=pool_activation,
