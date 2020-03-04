@@ -50,16 +50,13 @@ if keras.__version__[-2:] != 'tf' and keras.__version__ < '2.3':
             return non_trainable_weights
 
 
-class ZeroMasking(Layer):
-    """啥都不做，就是加上mask
+class Layer(Layer):
+    """给层添加supports_masking=True
+    （本项目所有自定义层都支持masking）
     """
-    def call(self, inputs):
-        self._output_mask = K.cast(K.greater(inputs, 0), K.floatx())
-        return inputs
-
-    @property
-    def output_mask(self):
-        return self._output_mask
+    def __init__(self, **kwargs):
+        super(Layer, self).__init__(**kwargs)
+        self.supports_masking=True
 
 
 class MultiHeadAttention(Layer):
@@ -114,7 +111,7 @@ class MultiHeadAttention(Layer):
                                                        initializer=initializer,
                                                        trainable=False)
 
-    def call(self, inputs, q_mask=None, v_mask=None, a_mask=None):
+    def call(self, inputs, mask=None, a_mask=None):
         """实现多头注意力
         q_mask: 对输入的query序列的mask。
                 主要是将输出结果的padding部分置0。
@@ -124,19 +121,17 @@ class MultiHeadAttention(Layer):
                 不同的attention mask对应不同的应用。
         """
         q, k, v = inputs[:3]
+        q_mask, v_mask = None, None
+        if mask is not None:
+            if mask[0] is not None:
+                q_mask = K.cast(mask[0], K.floatx())
+            if mask[2] is not None:
+                v_mask = K.cast(mask[2], K.floatx())
         if a_mask:
             if len(inputs) == 3:
                 a_mask = 'history_only'
             else:
                 a_mask = inputs[3]
-        if q_mask is not None:
-            if not hasattr(self, 'q_mask_layer'):
-                self.q_mask_layer = search_layer(q, q_mask)
-            q_mask = self.q_mask_layer.output_mask
-        if v_mask is not None:
-            if not hasattr(self, 'v_mask_layer'):
-                self.v_mask_layer = search_layer(v, v_mask)
-            v_mask = self.v_mask_layer.output_mask
         # Pooling
         if self.pool_size > 1:
             is_self_attention = (q is k is v)
@@ -205,6 +200,9 @@ class MultiHeadAttention(Layer):
 
     def compute_output_shape(self, input_shape):
         return (input_shape[0][0], input_shape[0][1], self.out_dim)
+
+    def compute_mask(self, inputs, mask):
+        return mask[0]
 
     def get_config(self):
         config = {
@@ -451,9 +449,7 @@ class FeedForward(Layer):
         # Pooling
         if self.pool_size > 1:
             if mask is not None:
-                if not hasattr(self, 'mask_layer'):
-                    self.mask_layer = search_layer(x, mask)
-                mask = self.mask_layer.output_mask
+                mask = K.cast(mask, K.floatx())
             x_in_len = K.shape(x)[1]
             x = sequence_masking(x, mask, 0)
             x = divisible_temporal_padding(x, self.pool_size)
@@ -536,6 +532,9 @@ class ConditionalRandomField(Layer):
             K.set_value(self.trans, K.eval(self.trans) / self.lr_multiplier)
             self.trans = self.lr_multiplier * self.trans
 
+    def compute_mask(self, inputs, mask=None):
+        return None
+
     def target_score(self, y_true, y_pred, mask=None):
         """计算目标路径的相对概率（还没有归一化）
         要点：逐标签得分，加上转移概率得分。
@@ -558,24 +557,14 @@ class ConditionalRandomField(Layer):
         outputs = mask * outputs + (1 - mask) * states[:, :, 0]
         return outputs, [outputs]
 
-    def call(self, inputs, mask=None):
-        """CRF本身不改变输出，它只是一个loss
-        """
-        if mask is not None:
-            if not hasattr(self, 'mask_layer'):
-                self.mask_layer = search_layer(inputs, mask)
-
-        return inputs
-
-    @property
-    def output_mask(self):
-        if hasattr(self, 'mask_layer'):
-            return self.mask_layer.output_mask
-
     def dense_loss(self, y_true, y_pred):
         """y_true需要是one hot形式
         """
-        mask = self.output_mask
+        # 导出mask并转换数据类型
+        if self.input_mask is None:
+            mask = None
+        else:
+            mask = K.cast(self.input_mask, K.floatx())
         # 计算目标分数
         target_score = self.target_score(y_true, y_pred, mask)
         # 递归计算log Z
@@ -613,7 +602,11 @@ class ConditionalRandomField(Layer):
         """训练过程中显示逐帧准确率的函数，排除了mask的影响
         此处y_true需要是整数形式（非one hot）
         """
-        mask = self.output_mask
+        # 导出mask并转换数据类型
+        if self.input_mask is None:
+            mask = None
+        else:
+            mask = K.cast(self.input_mask, K.floatx())
         # y_true需要重新明确一下shape和dtype
         y_true = K.reshape(y_true, K.shape(y_pred)[:-1])
         y_true = K.cast(y_true, 'int32')
@@ -671,19 +664,8 @@ class MaximumEntropyMarkovModel(Layer):
                 K.set_value(self.r_trans, K.eval(self.r_trans) / self.lr_multiplier)
                 self.r_trans = self.lr_multiplier * self.r_trans
 
-    def call(self, inputs, mask=None):
-        """MEMM本身不改变输出，它只是一个loss
-        """
-        if mask is not None:
-            if not hasattr(self, 'mask_layer'):
-                self.mask_layer = search_layer(inputs, mask)
-
-        return inputs
-
-    @property
-    def output_mask(self):
-        if hasattr(self, 'mask_layer'):
-            return self.mask_layer.output_mask
+    def compute_mask(self, inputs, mask=None):
+        return None
 
     def reverse_sequence(self, inputs, mask=None):
         if mask is None:
@@ -698,7 +680,11 @@ class MaximumEntropyMarkovModel(Layer):
     def basic_loss(self, y_true, y_pred, go_backwards=False):
         """y_true需要是整数形式（非one hot）
         """
-        mask = self.output_mask
+        # 导出mask并转换数据类型
+        if self.input_mask is None:
+            mask = None
+        else:
+            mask = K.cast(self.input_mask, K.floatx())
         # y_true需要重新明确一下shape和dtype
         y_true = K.reshape(y_true, K.shape(y_pred)[:-1])
         y_true = K.cast(y_true, 'int32')
@@ -744,7 +730,11 @@ class MaximumEntropyMarkovModel(Layer):
         """训练过程中显示逐帧准确率的函数，排除了mask的影响
         此处y_true需要是整数形式（非one hot）
         """
-        mask = self.output_mask
+        # 导出mask并转换数据类型
+        if self.input_mask is None:
+            mask = None
+        else:
+            mask = K.cast(self.input_mask, K.floatx())
         # y_true需要重新明确一下shape和dtype
         y_true = K.reshape(y_true, K.shape(y_pred)[:-1])
         y_true = K.cast(y_true, 'int32')
@@ -799,7 +789,6 @@ class MaximumEntropyMarkovModel(Layer):
 
 
 custom_objects = {
-    'ZeroMasking': ZeroMasking,
     'MultiHeadAttention': MultiHeadAttention,
     'LayerNormalization': LayerNormalization,
     'PositionEmbedding': PositionEmbedding,

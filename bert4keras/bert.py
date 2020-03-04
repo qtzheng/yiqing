@@ -11,7 +11,6 @@ class BertModel(object):
     """构建跟Bert一样结构的Transformer-based模型
     这是一个比较多接口的基础类，然后通过这个基础类衍生出更复杂的模型
     """
-
     def __init__(
             self,
             vocab_size,  # 词表大小
@@ -68,7 +67,6 @@ class BertModel(object):
     def build(self,
               position_ids=None,
               layer_norm_cond=None,
-              layer_norm_cond_size=None,
               layer_norm_cond_hidden_size=None,
               layer_norm_cond_hidden_act=None,
               additional_input_layers=None):
@@ -77,18 +75,12 @@ class BertModel(object):
         用来实现以“固定长度向量”为条件的条件Bert。
         """
         # 构建输入层
-        x_in = Input(shape=(None,), name='Input-Token')
-        s_in = Input(shape=(None,), name='Input-Segment')
+        x_in = Input(shape=(None, ), name='Input-Token')
+        s_in = Input(shape=(None, ), name='Input-Segment')
         x, s = input_layers = [x_in, s_in]
 
         # 条件输入
-        if layer_norm_cond is not None:
-            z = layer_norm_cond
-        elif layer_norm_cond_size is not None:
-            z = Input(shape=(layer_norm_cond_size,), name='LayerNorm-Condition')
-            input_layers.append(z)
-        else:
-            z = None
+        z = layer_norm_cond
         layer_norm_cond_hidden_act = layer_norm_cond_hidden_act or 'linear'
 
         # 补充输入层
@@ -98,13 +90,11 @@ class BertModel(object):
             else:
                 input_layers.append(additional_input_layers)
 
-        # 补充mask
-        x = ZeroMasking(name='Sequence-Mask')(x)
-
         # Embedding部分
         x = Embedding(input_dim=self.vocab_size,
                       output_dim=self.embedding_size,
                       embeddings_initializer=self.initializer,
+                      mask_zero=True,
                       name='Embedding-Token')(x)
         s = Embedding(input_dim=2,
                       output_dim=self.embedding_size,
@@ -153,34 +143,18 @@ class BertModel(object):
         if self.with_pool or self.with_nsp:
             # Pooler部分（提取CLS向量）
             x = outputs[0]
-
-            x1 = Bidirectional(LSTM(512, return_sequences=True, dropout=0.2, kernel_initializer=self.initializer))(
-                x)  # Lambda(lambda x: x[:, 0], name='Pooler')(x)
-            x1 = LSTM(512, return_sequences=True, dropout=0.2, kernel_initializer=self.initializer)(x)
-            x1 = LSTM(512, return_sequences=True, dropout=0.2, kernel_initializer=self.initializer)(x)
-            x1 = LSTM(1024, dropout=0.2, kernel_initializer=self.initializer)(x)
-            x1 = Dense(units=self.hidden_size,
-                       activation='tanh',
-                       kernel_initializer=self.initializer)(x1)
-
             x = Lambda(lambda x: x[:, 0], name='Pooler')(x)
             pool_activation = 'tanh' if self.with_pool is True else self.with_pool
             x = Dense(units=self.hidden_size,
                       activation=pool_activation,
                       kernel_initializer=self.initializer,
                       name='Pooler-Dense')(x)
-
-            x = Concatenate(axis=-1)([x, x1])
-            x = Dense(units=self.hidden_size,
-                      activation=pool_activation,
-                      kernel_initializer=self.initializer)(x)
             if self.with_nsp:
                 # Next Sentence Prediction部分
                 x = Dense(units=2,
                           activation='softmax',
                           kernel_initializer=self.initializer,
                           name='NSP-Proba')(x)
-
             outputs.append(x)
 
         if self.with_mlm:
@@ -257,21 +231,20 @@ class BertModel(object):
         ]
         # Self Attention
         xi, x = x, [x, x, x]
-        mask = 'Sequence-Mask'
         if attention_mask is None:
-            x = layers[0](x, q_mask=mask, v_mask=mask)
+            x = layers[0](x)
         elif attention_mask is 'history_only':
-            x = layers[0](x, q_mask=mask, v_mask=mask, a_mask=True)
+            x = layers[0](x, a_mask=True)
         else:
             x.append(attention_mask)
-            x = layers[0](x, q_mask=mask, v_mask=mask, a_mask=True)
+            x = layers[0](x, a_mask=True)
         if self.dropout_rate > 0:
             x = layers[1](x)
         x = layers[2]([xi, x])
         x = layers[3](self.filter([x, z]))
         # Feed Forward
         xi = x
-        x = layers[4](x, mask=mask)
+        x = layers[4](x)
         if self.dropout_rate > 0:
             x = layers[5](x)
         x = layers[6]([xi, x])
@@ -401,8 +374,8 @@ class BertModel(object):
             # 加载单个变量的函数
             variable = tf.train.load_variable(checkpoint_file, name)
             if name in [
-                'bert/embeddings/word_embeddings',
-                'cls/predictions/output_bias',
+                    'bert/embeddings/word_embeddings',
+                    'cls/predictions/output_bias',
             ]:
                 if self.keep_tokens is None:
                     return variable
@@ -486,7 +459,6 @@ class BertModel(object):
 class Bert4Seq2seq(BertModel):
     """用来做seq2seq任务的Bert
     """
-
     def __init__(self, *args, **kwargs):
         super(Bert4Seq2seq, self).__init__(*args, **kwargs)
         self.with_mlm = self.with_mlm or True
@@ -496,6 +468,7 @@ class Bert4Seq2seq(BertModel):
         """为seq2seq采用特定的attention mask
         """
         if self.attention_mask is None:
+
             def seq2seq_attention_mask(s):
                 import tensorflow as tf
                 seq_len = K.shape(s)[1]
@@ -517,7 +490,6 @@ class Bert4Seq2seq(BertModel):
 class Bert4LM(BertModel):
     """用来做语言模型任务的Bert
     """
-
     def __init__(self, *args, **kwargs):
         super(Bert4LM, self).__init__(*args, **kwargs)
         self.with_mlm = self.with_mlm or True
@@ -538,7 +510,6 @@ def build_bert_model(config_path,
                      attention_mask=None,
                      position_ids=None,
                      layer_norm_cond=None,
-                     layer_norm_cond_size=None,
                      layer_norm_cond_hidden_size=None,
                      layer_norm_cond_hidden_act=None,
                      additional_input_layers=None,
@@ -560,7 +531,7 @@ def build_bert_model(config_path,
                          str(list(applications.keys())))
 
     Bert = applications[application]
-
+    
     if attention_mask is not None:
         class Bert(Bert):
             def compute_attention_mask(self, layer_id, segment_ids):
@@ -588,7 +559,6 @@ def build_bert_model(config_path,
 
     bert.build(position_ids=position_ids,
                layer_norm_cond=layer_norm_cond,
-               layer_norm_cond_size=layer_norm_cond_size,
                layer_norm_cond_hidden_size=layer_norm_cond_hidden_size,
                layer_norm_cond_hidden_act=layer_norm_cond_hidden_act,
                additional_input_layers=additional_input_layers)
